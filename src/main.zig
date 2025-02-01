@@ -2,6 +2,56 @@ const std = @import("std");
 
 const OUT_FILE = "out.txt";
 
+fn on_accept(bg: *std.os.linux.IoUring.BufferGroup, cqe: std.os.linux.io_uring_cqe) !void {
+    std.debug.assert(cqe.res > 0);
+
+    std.debug.print("ACCEPTED CONN {d}\n", .{cqe.res});
+
+    // ensure that multishot will still accept connections
+    std.debug.assert(cqe.flags & std.os.linux.IORING_CQE_F_MORE > 0);
+
+    // now recv multishot for this conn
+    _ = try bg.recv_multishot(@as(u64, @intCast(cqe.res)), cqe.res, 0);
+}
+
+fn on_recv(bg: *std.os.linux.IoUring.BufferGroup, ring: *std.os.linux.IoUring, cqe: std.os.linux.io_uring_cqe) !void {
+    // If recv 0 bytes, close conn
+    if (cqe.res == 0) {
+        std.debug.print("CLOSING CLIENT CONN {d}\n", .{cqe.user_data});
+        std.posix.close(@as(i32, @intCast(cqe.user_data)));
+        return;
+    }
+
+    // Ensure that multishot will still recv data
+    std.debug.assert(cqe.flags & std.os.linux.IORING_CQE_F_MORE > 0);
+
+    // cqe os.linux.io_uring_cqe{ .user_data = 5, .res = 5, .flags = 3 }
+    std.debug.print("RECEIVED {d} ON CONN {b}\n", .{ cqe.res, cqe.user_data });
+
+    // Get the buffer with the data
+    const data = try bg.get_cqe(cqe);
+    std.debug.print("GOT DATA: {s}\n", .{data});
+
+    // Write the data back (just prep the sqe)
+    var write_sqe = try ring.write(cqe.user_data, @as(i32, @intCast(cqe.user_data)), data, 0);
+
+    // Also, I don't care about success right now, it would mess up my whole
+    // logic (trying to use the socket fd in the user_data, rather than a ptr).
+    // There's probably some error handling I'm not doing if the write doesn't
+    // work, or all the bytes aren't fully written or something. Oh well.
+    write_sqe.flags = std.os.linux.IOSQE_CQE_SKIP_SUCCESS;
+
+    // Give the buffer back to io_uring
+    // NOTE: This is probably a bug, releasing the buffer before the write? I
+    // would love not to copy any data but might need to to avoid a race
+    // condition where the prepped write data is overwritten by another recv.
+    // NOTE: To avoid the race I'd need to handle the write results to give the
+    // buf back to iouring, and would have to move away from the user_data
+    // being the raw connection, since I wouldn't be able to tell what was a
+    // write result or a recv result.
+    _ = try bg.put_cqe(cqe);
+}
+
 pub fn main() !void {
     const allocator = &std.heap.page_allocator;
     const entries = 128;
@@ -41,7 +91,7 @@ pub fn main() !void {
 
     // server loop
     while (true) {
-        // submit atleast 1
+        // submit at least 1
         const submitted = try ring.submit_and_wait(1);
         std.debug.print("SUBMITTED {d}\n", .{submitted});
         const cqes_ready = try ring.copy_cqes(cqes, 0);
@@ -50,28 +100,9 @@ pub fn main() !void {
             const cqe = cqes[i];
             std.debug.print("cqe {any}\n", .{cqe});
             if (cqe.user_data == 0) {
-                std.debug.print("ACCEPTED CONN {d}\n", .{cqe.res});
-                // ensure that multishot will still accept connections
-                std.debug.assert(cqe.flags & std.os.linux.IORING_CQE_F_MORE > 0);
-
-                // now recv multishot for this conn
-                _ = try bg.recv_multishot(@as(u64, @intCast(cqe.res)), cqe.res, 0);
+                _ = try on_accept(&bg, cqe);
             } else {
-                if (cqe.res < 0) {
-                    const errno = @as(std.posix.E, @enumFromInt(-cqe.res));
-                    std.debug.print("INVALID ERRNO {any}\n", .{errno});
-                } else {
-
-                    // If recv 0 bytes, close conn
-                    if (cqe.res == 0) {
-                        std.posix.close(@as(i32, @intCast(cqe.user_data)));
-                    }
-
-                    std.debug.print("RECEIVED {d} ON CONN {b}\n", .{ cqe.res, cqe.user_data });
-                    // If recv >0 bytes, and no IORING_CQE_F_MORE flags, resubmit
-                    // recv multishot (just crashing for now)
-                    std.debug.assert(cqe.flags & std.os.linux.IORING_CQE_F_MORE > 0);
-                }
+                _ = try on_recv(&bg, &ring, cqe);
             }
         }
     }
