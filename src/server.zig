@@ -2,8 +2,6 @@ const std = @import("std");
 const server = @import("server.zig");
 const client = @import("client.zig");
 
-const OUT_FILE = "out.txt";
-
 fn on_accept(bg: *std.os.linux.IoUring.BufferGroup, cqe: std.os.linux.io_uring_cqe) !void {
     std.debug.assert(cqe.res > 0);
 
@@ -31,7 +29,7 @@ fn on_recv(bg: *std.os.linux.IoUring.BufferGroup, ring: *std.os.linux.IoUring, c
     std.debug.print("RECEIVED {d} ON CONN {b}\n", .{ cqe.res, cqe.user_data });
 
     // Get the buffer with the data
-    const data = try bg.get_cqe(cqe);
+    const data = try bg.get(cqe);
     std.debug.print("GOT DATA: {s}\n", .{data});
 
     // Write the data back (just prep the sqe)
@@ -51,12 +49,12 @@ fn on_recv(bg: *std.os.linux.IoUring.BufferGroup, ring: *std.os.linux.IoUring, c
     // buf back to iouring, and would have to move away from the user_data
     // being the raw connection, since I wouldn't be able to tell what was a
     // write result or a recv result.
-    _ = try bg.put_cqe(cqe);
+    _ = try bg.put(cqe);
 }
 
 pub fn run() !void {
     std.debug.print("Running echo server\n", .{});
-    const allocator = &std.heap.page_allocator;
+    var allocator = std.heap.page_allocator;
     const entries = 128;
     // submit_and_wait docs say these should be set if a) single thread
     // accessing ring and b) submitting work with `IORING_ENTER_GETEVENTS` as
@@ -69,9 +67,8 @@ pub fn run() !void {
     defer ring.deinit();
     const buffers_count = 16;
     const buffer_size = 4069;
-    var buffers: [buffers_count * buffer_size]u8 = undefined;
-    var bg = try std.os.linux.IoUring.BufferGroup.init(&ring, 0, buffers[0..], buffer_size, buffers_count);
-    defer bg.deinit();
+    var bg = try std.os.linux.IoUring.BufferGroup.init(&ring, allocator, 0, buffer_size, buffers_count);
+    defer bg.deinit(allocator);
     const cqes = try allocator.alloc(std.os.linux.io_uring_cqe, entries);
     defer allocator.free(cqes);
 
